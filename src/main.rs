@@ -60,6 +60,7 @@ fn main() {
 
     let selected_path = tui::run_tui(
         &args.search_term,
+        args.regex,
         &current_dir,
         config.page_size,
         rx,

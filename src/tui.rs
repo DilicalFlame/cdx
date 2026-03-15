@@ -1,13 +1,92 @@
 use std::cmp;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use colored::*;
 use console::{Key, Term};
+use regex::RegexBuilder;
+
+fn highlight_and_chunk_path(text: &str, term: &str, is_regex: bool, term_width: usize) -> Vec<String> {
+    let mut highlighted_spans = Vec::new();
+    
+    let re_res = if is_regex {
+        RegexBuilder::new(term).case_insensitive(true).build().ok()
+    } else {
+        RegexBuilder::new(&regex::escape(term)).case_insensitive(true).build().ok()
+    };
+
+    let chars: Vec<char> = text.chars().collect();
+
+    if let Some(re) = re_res {
+        if !re.as_str().is_empty() {
+            for mat in re.find_iter(text) {
+                // translate byte indices to char indices for iteration
+                let start_char = text[..mat.start()].chars().count();
+                let end_char = text[..mat.end()].chars().count();
+                highlighted_spans.push((start_char, end_char));
+            }
+        }
+    }
+
+    let mut lines = Vec::new();
+    let mut current_idx = 0;
+    let mut first_line = true;
+
+    while current_idx < chars.len() {
+        let indent = if first_line { 10 } else { 10 };
+        let avail = term_width.saturating_sub(indent).max(10);
+        let chunk_end = cmp::min(current_idx + avail, chars.len());
+        let chunk = &chars[current_idx..chunk_end];
+        
+        let mut colored_chunk = String::new();
+        let mut current_style_highlighted = false;
+        let mut temp_str = String::new();
+
+        for (i, &c) in chunk.iter().enumerate() {
+            let global_i = current_idx + i;
+            let is_highlighted = highlighted_spans.iter().any(|&(s, e)| global_i >= s && global_i < e);
+            
+            if i == 0 {
+                current_style_highlighted = is_highlighted;
+            }
+
+            if is_highlighted == current_style_highlighted {
+                temp_str.push(c);
+            } else {
+                if current_style_highlighted {
+                    colored_chunk.push_str(&temp_str.black().on_yellow().bold().to_string());
+                } else {
+                    colored_chunk.push_str(&temp_str.cyan().to_string());
+                }
+                temp_str.clear();
+                temp_str.push(c);
+                current_style_highlighted = is_highlighted;
+            }
+        }
+
+        if !temp_str.is_empty() {
+            if current_style_highlighted {
+                colored_chunk.push_str(&temp_str.black().on_yellow().bold().to_string());
+            } else {
+                colored_chunk.push_str(&temp_str.cyan().to_string());
+            }
+        }
+
+        if first_line {
+            lines.push(format!(" {} {}", "📂 Path:".yellow(), colored_chunk));
+            first_line = false;
+        } else {
+            lines.push(format!("          {}", colored_chunk));
+        }
+        
+        current_idx = chunk_end;
+    }
+    
+    lines
+}
 
 fn sort_paths(paths: &mut Vec<PathBuf>) {
     // Sort by Number of Components (Depth) first, then Alphabetically secondary
@@ -28,12 +107,12 @@ fn chunks(paths: &[PathBuf], size: usize) -> Vec<Vec<PathBuf>> {
 fn render_page(
     term: &mut Term,
     term_str: &str,
+    is_regex: bool,
     page_items: &[PathBuf],
     current_dir: &Path,
     curr_sel: usize,
     curr_page: usize,
     total_pages: usize,
-    is_done: bool,
     page_size: usize,
     lines_drawn: &mut usize,
 ) {
@@ -45,8 +124,17 @@ fn render_page(
     let (_, cols) = term.size();
     let term_width = (cols as usize).saturating_sub(1).max(40); // Provide safe margin and minimum bounds
 
+    let has_next = curr_page + 1 < total_pages;
+    let next_indicator = if has_next { "►" } else { " " };
+    let prev_indicator = if curr_page > 0 { "◄" } else { " " };
+    let page_info = format!("Page {} {} {}", prev_indicator, curr_page + 1, next_indicator);
+    let controls = "[↑/↓] Navigate  [←/→] Pages  [↵] Select  [Esc] Quit";
+
     lines.push(format!(" {} {}", "🔍 Search results for:".cyan(), term_str.cyan().bold()));
+    lines.push(format!(" {}   {}", page_info.yellow(), controls.dimmed()));
     lines.push(format!("{}", "─".repeat(term_width).dimmed()));
+
+    let max_dir_width = cmp::max(20, term_width / 2); // Give directory name max 50% of screen width
 
     for i in 0..page_size {
         if i < page_items.len() {
@@ -57,8 +145,18 @@ fn render_page(
             let dir_width = console::measure_text_width(&dir_name);
             let rel_width = console::measure_text_width(&rel_path);
 
+            // Safety measure to ensure rel_path gets enough space: Truncate dir_name if it is too massive
+            let dir_display = if dir_width > max_dir_width {
+                let trunc: String = dir_name.chars().take(max_dir_width - 3).collect();
+                format!("{}...", trunc)
+            } else {
+                dir_name
+            };
+
+            let act_dir_width = console::measure_text_width(&dir_display);
+
             // " ❯ 📁 " + dir_name + "  " -> Approx width footprint (8 cols)
-            let base_width = 8 + dir_width + 2;
+            let base_width = 8 + act_dir_width + 2;
 
             // Truncate from the middle of the relative path if it overflows terminal width
             let display_rel_path = if base_width < term_width {
@@ -66,8 +164,8 @@ fn render_page(
                 if rel_width > available {
                     if available > 5 {
                         let allowed = available - 3;
-                        // Keep 2/3 of the start, and 1/3 of the end
-                        let start_len = (allowed * 2) / 3;
+                        // Keep 1/3 of the start, and 2/3 of the end
+                        let start_len = allowed / 3;
                         let end_len = allowed - start_len;
                         let start_part: String = rel_path.chars().take(start_len).collect();
                         let end_part: String = rel_path.chars().rev().take(end_len).collect::<Vec<_>>().into_iter().rev().collect();
@@ -80,15 +178,6 @@ fn render_page(
                 }
             } else {
                 "".to_string()
-            };
-
-            // Safety measure if dir_name itself is longer than terminal width
-            let dir_display = if base_width >= term_width && term_width > 12 {
-                let allowed = term_width - 11;
-                let trunc: String = dir_name.chars().take(allowed).collect();
-                format!("{}...", trunc)
-            } else {
-                dir_name
             };
 
             if i == curr_sel {
@@ -117,14 +206,15 @@ fn render_page(
 
     lines.push(format!("{}", "─".repeat(term_width).dimmed()));
 
-    let has_next = !is_done || curr_page + 1 < total_pages;
-    let next_indicator = if has_next { "►" } else { " " };
-    let prev_indicator = if curr_page > 0 { "◄" } else { " " };
-
-    let page_info = format!("Page {} {} {}", prev_indicator, curr_page + 1, next_indicator);
-    let controls = "[↑/↓] Navigate  [←/→] Pages  [↵] Select  [Esc] Quit";
-
-    lines.push(format!(" {} │ {}", page_info.yellow(), controls.dimmed()));
+    // Dedicated Full-Path Preview section for currently hovered item
+    if let Some(hover_path) = page_items.get(curr_sel) {
+        let abs_path = hover_path.display().to_string();
+        let preview_lines = highlight_and_chunk_path(&abs_path, term_str, is_regex, term_width);
+        for line in preview_lines {
+            lines.push(line);
+        }
+        lines.push(format!("{}", "─".repeat(term_width).dimmed()));
+    }
 
     let output = lines.join("\n");
     let _ = term.write_line(&output);
@@ -134,6 +224,7 @@ fn render_page(
 
 pub fn run_tui(
     term_str: &str,
+    is_regex: bool,
     current_dir: &Path,
     page_size: usize,
     rx: Receiver<PathBuf>,
@@ -147,7 +238,7 @@ pub fn run_tui(
     let mut frame_idx = 0;
     
     // Draw initial loading spinner
-    let mut spinner_drawn = true;
+    let spinner_drawn = true;
     let _ = term.write_line(&format!(" {} {}", spinner_frames[frame_idx].cyan(), "Crawling file system...".dimmed()));
 
     // Collect all matches across the entire drive instantly into memory
@@ -207,12 +298,12 @@ pub fn run_tui(
         render_page(
             &mut term,
             term_str,
+            is_regex,
             current_items,
             current_dir,
             curr_sel,
             curr_page,
             paged_cache.len(),
-            true, // is_done is always true now because we pre-collected
             page_size,
             &mut lines_drawn,
         );
