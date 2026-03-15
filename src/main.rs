@@ -18,6 +18,10 @@ struct Args {
     /// The starting sequence of the directory name to search for (e.g., "101", "400.17").
     search_term: String,
 
+    /// Evaluate the search term as a Regular Expression rather than a simple prefix.
+    #[arg(short, long)]
+    regex: bool,
+
     /// Optional file path to write the selected directory to (for shell integration).
     #[arg(long, hide = true)]
     out: Option<PathBuf>,
@@ -48,6 +52,7 @@ fn main() {
         current_dir.clone(),
         args.search_term.clone(),
         config.clone(),
+        args.regex,
         tx,
         Arc::clone(&is_done),
     );

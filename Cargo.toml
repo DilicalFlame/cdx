@@ -9,6 +9,7 @@ colored = "2.1.0"
 console = "0.16.3"
 directories = "6.0.0"
 ignore = "0.4.25"
+regex = "1.12.3"
 serde = { version = "1.0.228", features = ["derive"] }
 tempfile = "3.27.0"
 toml = "1.0.6"
