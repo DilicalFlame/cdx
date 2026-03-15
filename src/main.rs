@@ -15,10 +15,10 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// The starting sequence of the directory name to search for (e.g., "101", "400.17").
+    /// The sequence of the directory name to search for (e.g., "101", "400.17", or a regex like "^data.*").
     search_term: String,
 
-    /// Evaluate the search term as a Regular Expression rather than a simple prefix.
+    /// Evaluate the search term as a Regular Expression rather than a simple substring.
     #[arg(short, long)]
     regex: bool,
 

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::config::Config;
-use ignore::{WalkBuilder, WalkState};
+use ignore::WalkBuilder;
 
 pub fn spawn_search_thread(
     current_dir: PathBuf,
@@ -41,38 +41,37 @@ pub fn spawn_search_thread(
             None
         };
 
-        // Parallel traversal
-        builder.build_parallel().run(|| {
-            let tx = tx.clone();
-            let term = term_str.clone();
-            let regex_clone = regex_opt.clone();
-            
-            Box::new(move |result| {
-                if let Ok(entry) = result {
-                    if entry.depth() == 0 {
-                        return WalkState::Continue;
-                    }
+        // Convert search term to lowercase for a case-insensitive contains match fallback
+        let term_lower = term_str.to_lowercase();
 
-                    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                        if let Some(file_name) = entry.file_name().to_str() {
-                            let is_match = if let Some(ref re) = regex_clone {
-                                re.is_match(file_name)
-                            } else {
-                                file_name.starts_with(&term)
-                            };
+        // Force deterministic alphabetical sorting for siblings
+        builder.sort_by_file_name(|a, b| a.cmp(b));
 
-                            if is_match {
-                                // Send blocks when channel is full, efficiently pausing the search!
-                                if tx.send(entry.into_path()).is_err() {
-                                    return WalkState::Quit;
-                                }
+        // Standard single-threaded traversal (required for strict tree sorting)
+        for result in builder.build() {
+            if let Ok(entry) = result {
+                if entry.depth() == 0 {
+                    continue;
+                }
+
+                if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                    if let Some(file_name) = entry.file_name().to_str() {
+                        let is_match = if let Some(ref re) = regex_opt {
+                            re.is_match(file_name)
+                        } else {
+                            file_name.to_lowercase().contains(&term_lower)
+                        };
+
+                        if is_match {
+                            // Send blocks when channel is full, efficiently pausing the search!
+                            if tx.send(entry.into_path()).is_err() {
+                                break;
                             }
                         }
                     }
                 }
-                WalkState::Continue
-            })
-        });
+            }
+        }
 
         is_done.store(true, Ordering::SeqCst);
     });
