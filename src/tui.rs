@@ -89,18 +89,6 @@ fn highlight_and_chunk_path(text: &str, term: &str, is_regex: bool, term_width: 
     lines
 }
 
-fn sort_paths(paths: &mut Vec<PathBuf>) {
-    // Sort by Number of Components (Depth) first, then Alphabetically secondary
-    paths.sort_by(|a, b| {
-        let count_a = a.components().count();
-        let count_b = b.components().count();
-        match count_a.cmp(&count_b) {
-            cmp::Ordering::Equal => a.cmp(b),
-            other => other,
-        }
-    });
-}
-
 fn chunks(paths: &[PathBuf], size: usize) -> Vec<Vec<PathBuf>> {
     paths.chunks(size).map(|c| c.to_vec()).collect()
 }
@@ -115,11 +103,14 @@ fn render_page(
     curr_sel: usize,
     curr_page: usize,
     total_pages: usize,
+    total_results: usize,
     page_size: usize,
     term_rows: usize,
     lines_drawn: &mut usize,
     in_search_mode: bool,
     tui_search_query: &str,
+    still_searching: bool,
+    spinner_frame: &str,
 ) {
     if !paginate && *lines_drawn > 0 {
         let _ = term.clear_last_lines(*lines_drawn);
@@ -140,7 +131,20 @@ fn render_page(
     let page_info = format!("Page {} {} {}", prev_indicator, curr_page + 1, next_indicator);
     let controls = "[↑/↓] Navigate  [←/→] Pages  [↵] Select  [Esc] Quit";
 
-    lines.push(format!(" {} {}", "🔍 Search results for:".cyan(), term_str.cyan().bold()));
+    if still_searching {
+        lines.push(format!(" {} {} {} {}",
+            spinner_frame.cyan(),
+            "Searching:".cyan(),
+            term_str.cyan().bold(),
+            format!("({} found)", total_results).yellow()
+        ));
+    } else {
+        lines.push(format!(" {} {} {}",
+            "🔍 Search results for:".cyan(),
+            term_str.cyan().bold(),
+            format!("({} total)", total_results).dimmed()
+        ));
+    }
     lines.push(format!(" {}   {}", page_info.yellow(), controls.dimmed()));
     lines.push(format!("{}", "─".repeat(term_width).dimmed()));
 
@@ -290,55 +294,7 @@ pub fn run_tui(
 
     let mut cached_paths: Vec<PathBuf> = Vec::new();
     let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let mut frame_idx = 0;
-    
-    // Draw initial loading spinner
-    let spinner_drawn = true;
-    let _ = term.write_line(&format!(" {} {}", spinner_frames[frame_idx].cyan(), "Crawling file system...".dimmed()));
-
-    // Collect all matches across the entire drive instantly into memory
-    loop {
-        // Pull continuously while there is data
-        while let Ok(p) = rx.try_recv() {
-            cached_paths.push(p);
-        }
-
-        if is_done.load(Ordering::SeqCst) {
-            // Drain the last few items
-            while let Ok(p) = rx.try_recv() {
-                cached_paths.push(p);
-            }
-            break;
-        }
-
-        // UI Spinner feedback loop so the user knows it's doing heavy I/O
-        frame_idx = (frame_idx + 1) % spinner_frames.len();
-        let _ = term.clear_last_lines(1);
-        let _ = term.write_line(&format!(" {} {} (Found {} so far)", 
-            spinner_frames[frame_idx].cyan(), 
-            "Crawling file system...".dimmed(),
-            cached_paths.len().to_string().yellow()
-        ));
-        
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    if spinner_drawn {
-        let _ = term.clear_last_lines(1);
-    }
-
-    if cached_paths.is_empty() {
-        eprintln!("{}", "No matching directory found.".red());
-        return None;
-    }
-
-    // Single global deterministic sort: Depth-First, then Alphabetical!
-    sort_paths(&mut cached_paths);
-
-    // Auto-select if there is exactly 1 match
-    if cached_paths.len() == 1 {
-        return Some(cached_paths[0].clone());
-    }
+    let mut frame_idx: usize = 0;
 
     let mut curr_page = 0;
     let mut curr_sel = 0;
@@ -347,10 +303,72 @@ pub fn run_tui(
     let mut tui_search_query = String::new();
     let mut in_search_mode = false;
 
+    // Spawn a dedicated key-reader thread so we can poll for keys non-blockingly
+    let (key_tx, key_rx) = crossbeam_channel::unbounded();
+    let key_term = Term::stdout();
+    std::thread::spawn(move || {
+        loop {
+            match key_term.read_key() {
+                Ok(key) => {
+                    if key_tx.send(key).is_err() {
+                        break; // Main thread dropped the receiver
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     loop {
-        // Compute page size with fixed minimal footer (separator + 1 path line + separator = 3 lines)
-        // This keeps chunking stable. render_page handles the visual trimming dynamically.
-        let (term_rows, term_cols) = if paginate {
+        // --- Phase 1: Drain new results from the search channel ---
+        while let Ok(p) = rx.try_recv() {
+            cached_paths.push(p);
+        }
+
+        let still_searching = !is_done.load(Ordering::SeqCst);
+
+        // If we have nothing yet, show a brief loading state and continue
+        if cached_paths.is_empty() {
+            if !still_searching {
+                // Search finished with zero results
+                if paginate {
+                    print!("\x1B[?1049l");
+                    let _ = std::io::stdout().flush();
+                }
+                let _ = term.show_cursor();
+                eprintln!("{}", "No matching directory found.".red());
+                return None;
+            }
+            // Show spinner while waiting for first results
+            frame_idx = (frame_idx + 1) % spinner_frames.len();
+            if !paginate {
+                if lines_drawn > 0 {
+                    let _ = term.clear_last_lines(lines_drawn);
+                }
+                let _ = term.write_line(&format!(" {} {} ",
+                    spinner_frames[frame_idx].cyan(),
+                    "Crawling file system...".dimmed(),
+                ));
+                lines_drawn = 1;
+            } else {
+                print!("\x1B[H {} {} \x1B[K",
+                    spinner_frames[frame_idx].cyan(),
+                    "Crawling file system...".dimmed(),
+                );
+                let _ = std::io::stdout().flush();
+            }
+            std::thread::sleep(Duration::from_millis(30));
+            continue;
+        }
+
+        // Auto-select if search is done and exactly 1 match
+        if !still_searching && cached_paths.len() == 1 {
+            selected_path = Some(cached_paths[0].clone());
+            break;
+        }
+
+        // --- Phase 2: Compute page size ---
+        let (term_rows, _term_cols) = if paginate {
             if let Some((Width(w), Height(h))) = terminal_size() {
                 (h as usize, w as usize)
             } else {
@@ -358,11 +376,10 @@ pub fn run_tui(
                 (r as usize, c as usize)
             }
         } else {
-            (0, 0) // Not used in non-paginate mode
+            (0, 0)
         };
 
         if paginate {
-            // 3 header + 3 minimal footer = 6 lines reserved
             let new_page_size = term_rows.saturating_sub(6).max(1);
             if new_page_size != page_size {
                 let gi = if page_size > 0 { curr_page * page_size + curr_sel } else { 0 };
@@ -375,13 +392,22 @@ pub fn run_tui(
             }
         }
 
+        // --- Phase 3: Render ---
         let paged_cache = chunks(&cached_paths, page_size);
-        if paged_cache.is_empty() { break; }
+        if paged_cache.is_empty() {
+            std::thread::sleep(Duration::from_millis(30));
+            continue;
+        }
 
         if curr_page >= paged_cache.len() {
             curr_page = paged_cache.len().saturating_sub(1);
             curr_sel = paged_cache[curr_page].len().saturating_sub(1);
         }
+        if curr_sel >= paged_cache[curr_page].len() {
+            curr_sel = paged_cache[curr_page].len().saturating_sub(1);
+        }
+
+        frame_idx = (frame_idx + 1) % spinner_frames.len();
 
         let current_items = &paged_cache[curr_page];
 
@@ -395,161 +421,191 @@ pub fn run_tui(
             curr_sel,
             curr_page,
             paged_cache.len(),
+            cached_paths.len(),
             page_size,
             term_rows,
             &mut lines_drawn,
             in_search_mode,
             &tui_search_query,
+            still_searching,
+            spinner_frames[frame_idx],
         );
 
-        match term.read_key().unwrap() {
-            Key::Escape => {
-                if in_search_mode {
-                    in_search_mode = false;
-                } else {
-                    break;
-                }
+        // --- Phase 4: Poll for key input (non-blocking with timeout) ---
+        // Drain ALL queued keys in one burst so rapid navigation doesn't lag
+        let timeout = if still_searching {
+            Duration::from_millis(60)
+        } else {
+            Duration::from_millis(500)
+        };
+
+        // Wait for the first key (with timeout)
+        let first_key = key_rx.recv_timeout(timeout).ok();
+        // Then drain any additional queued keys instantly
+        let mut keys: Vec<Key> = Vec::new();
+        if let Some(k) = first_key {
+            keys.push(k);
+            while let Ok(k) = key_rx.try_recv() {
+                keys.push(k);
             }
-            Key::Enter => {
-                if in_search_mode {
-                    in_search_mode = false;
-                    if let Some(pos) = cached_paths.iter().position(|p| {
-                        p.display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase())
-                    }) {
-                        curr_page = pos / page_size;
-                        curr_sel = pos % page_size;
-                    }
-                } else {
-                    selected_path = Some(paged_cache[curr_page][curr_sel].clone());
-                    break;
-                }
-            }
-            Key::Backspace => {
-                if in_search_mode {
-                    tui_search_query.pop();
-                }
-            }
-            Key::ArrowUp => {
-                if !in_search_mode {
-                    if curr_sel > 0 {
-                        curr_sel -= 1;
-                    } else if curr_page > 0 {
-                        curr_page -= 1;
-                        curr_sel = paged_cache[curr_page].len() - 1;
+        }
+
+        let mut should_break = false;
+        for key in keys {
+        match key {
+                Key::Escape => {
+                    if in_search_mode {
+                        in_search_mode = false;
+                    } else {
+                        should_break = true;
+                        break;
                     }
                 }
-            }
-            Key::ArrowDown => {
-                if !in_search_mode {
-                    let current_items = &paged_cache[curr_page];
-                    if curr_sel + 1 < current_items.len() {
-                        curr_sel += 1;
-                    } else if curr_page + 1 < paged_cache.len() {
-                        curr_page += 1;
-                        curr_sel = 0;
+                Key::Enter => {
+                    if in_search_mode {
+                        in_search_mode = false;
+                        if let Some(pos) = cached_paths.iter().position(|p| {
+                            p.display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase())
+                        }) {
+                            curr_page = pos / page_size;
+                            curr_sel = pos % page_size;
+                        }
+                    } else {
+                        selected_path = Some(paged_cache[curr_page][curr_sel].clone());
+                        should_break = true;
+                        break;
                     }
                 }
-            }
-            Key::ArrowLeft => {
-                if !in_search_mode {
-                    if curr_page > 0 {
-                        curr_page -= 1;
-                        curr_sel = cmp::min(curr_sel, paged_cache[curr_page].len().saturating_sub(1));
+                Key::Backspace => {
+                    if in_search_mode {
+                        tui_search_query.pop();
                     }
                 }
-            }
-            Key::ArrowRight => {
-                if !in_search_mode {
-                    if curr_page + 1 < paged_cache.len() {
-                        curr_page += 1;
-                        curr_sel = cmp::min(curr_sel, paged_cache[curr_page].len().saturating_sub(1));
+                Key::ArrowUp => {
+                    if !in_search_mode {
+                        if curr_sel > 0 {
+                            curr_sel -= 1;
+                        } else if curr_page > 0 {
+                            curr_page -= 1;
+                            curr_sel = paged_cache[curr_page].len() - 1;
+                        }
                     }
                 }
-            }
-            Key::Char(c) => {
-                if in_search_mode {
-                    tui_search_query.push(c);
-                } else {
-                    match c {
-                        'k' => {
-                            if curr_sel > 0 {
-                                curr_sel -= 1;
-                            } else if curr_page > 0 {
-                                curr_page -= 1;
-                                curr_sel = paged_cache[curr_page].len() - 1;
-                            }
+                Key::ArrowDown => {
+                    if !in_search_mode {
+                        let current_items = &paged_cache[curr_page];
+                        if curr_sel + 1 < current_items.len() {
+                            curr_sel += 1;
+                        } else if curr_page + 1 < paged_cache.len() {
+                            curr_page += 1;
+                            curr_sel = 0;
                         }
-                        'j' => {
-                            let current_items = &paged_cache[curr_page];
-                            if curr_sel + 1 < current_items.len() {
-                                curr_sel += 1;
-                            } else if curr_page + 1 < paged_cache.len() {
-                                curr_page += 1;
-                                curr_sel = 0;
-                            }
+                    }
+                }
+                Key::ArrowLeft => {
+                    if !in_search_mode {
+                        if curr_page > 0 {
+                            curr_page -= 1;
+                            curr_sel = cmp::min(curr_sel, paged_cache[curr_page].len().saturating_sub(1));
                         }
-                        'h' => {
-                            if curr_page > 0 {
-                                curr_page -= 1;
-                                curr_sel = cmp::min(curr_sel, paged_cache[curr_page].len().saturating_sub(1));
-                            }
+                    }
+                }
+                Key::ArrowRight => {
+                    if !in_search_mode {
+                        if curr_page + 1 < paged_cache.len() {
+                            curr_page += 1;
+                            curr_sel = cmp::min(curr_sel, paged_cache[curr_page].len().saturating_sub(1));
                         }
-                        'l' => {
-                            if curr_page + 1 < paged_cache.len() {
-                                curr_page += 1;
-                                curr_sel = cmp::min(curr_sel, paged_cache[curr_page].len().saturating_sub(1));
-                            }
-                        }
-                        '/' => {
-                            in_search_mode = true;
-                            tui_search_query.clear();
-                        }
-                        'n' => {
-                            let global_idx = curr_page * page_size + curr_sel;
-                            if let Some(offset) = cached_paths.iter().skip(global_idx + 1).position(|p| {
-                                p.display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase())
-                            }) {
-                                let pos = global_idx + 1 + offset;
-                                curr_page = pos / page_size;
-                                curr_sel = pos % page_size;
-                            } else if let Some(pos) = cached_paths.iter().position(|p| {
-                                p.display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase())
-                            }) {
-                                curr_page = pos / page_size;
-                                curr_sel = pos % page_size;
-                            }
-                        }
-                        'N' => {
-                            let global_idx = curr_page * page_size + curr_sel;
-                            let mut found = None;
-                            for i in (0..global_idx).rev() {
-                                if cached_paths[i].display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase()) {
-                                    found = Some(i);
-                                    break;
+                    }
+                }
+                Key::Char(c) => {
+                    if in_search_mode {
+                        tui_search_query.push(c);
+                    } else {
+                        match c {
+                            'k' => {
+                                if curr_sel > 0 {
+                                    curr_sel -= 1;
+                                } else if curr_page > 0 {
+                                    curr_page -= 1;
+                                    curr_sel = paged_cache[curr_page].len() - 1;
                                 }
                             }
-                            if found.is_none() {
-                                for i in (global_idx..cached_paths.len()).rev() {
+                            'j' => {
+                                let current_items = &paged_cache[curr_page];
+                                if curr_sel + 1 < current_items.len() {
+                                    curr_sel += 1;
+                                } else if curr_page + 1 < paged_cache.len() {
+                                    curr_page += 1;
+                                    curr_sel = 0;
+                                }
+                            }
+                            'h' => {
+                                if curr_page > 0 {
+                                    curr_page -= 1;
+                                    curr_sel = cmp::min(curr_sel, paged_cache[curr_page].len().saturating_sub(1));
+                                }
+                            }
+                            'l' => {
+                                if curr_page + 1 < paged_cache.len() {
+                                    curr_page += 1;
+                                    curr_sel = cmp::min(curr_sel, paged_cache[curr_page].len().saturating_sub(1));
+                                }
+                            }
+                            '/' => {
+                                in_search_mode = true;
+                                tui_search_query.clear();
+                            }
+                            'n' => {
+                                let global_idx = curr_page * page_size + curr_sel;
+                                if let Some(offset) = cached_paths.iter().skip(global_idx + 1).position(|p| {
+                                    p.display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase())
+                                }) {
+                                    let pos = global_idx + 1 + offset;
+                                    curr_page = pos / page_size;
+                                    curr_sel = pos % page_size;
+                                } else if let Some(pos) = cached_paths.iter().position(|p| {
+                                    p.display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase())
+                                }) {
+                                    curr_page = pos / page_size;
+                                    curr_sel = pos % page_size;
+                                }
+                            }
+                            'N' => {
+                                let global_idx = curr_page * page_size + curr_sel;
+                                let mut found = None;
+                                for i in (0..global_idx).rev() {
                                     if cached_paths[i].display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase()) {
                                         found = Some(i);
                                         break;
                                     }
                                 }
+                                if found.is_none() {
+                                    for i in (global_idx..cached_paths.len()).rev() {
+                                        if cached_paths[i].display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase()) {
+                                            found = Some(i);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if let Some(pos) = found {
+                                    curr_page = pos / page_size;
+                                    curr_sel = pos % page_size;
+                                }
                             }
-                            if let Some(pos) = found {
-                                curr_page = pos / page_size;
-                                curr_sel = pos % page_size;
+                            'q' | 'c' => {
+                                should_break = true;
+                                break;
                             }
+                            _ => {}
                         }
-                        'q' | 'c' => {
-                            break;
-                        }
-                        _ => {}
                     }
                 }
+                _ => {}
             }
-            _ => {}
-        }
+            if should_break { break; }
+        } // end for key in keys
+        if should_break { break; }
     }
 
     if paginate {
