@@ -6,7 +6,6 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -25,6 +24,10 @@ struct Args {
     /// Dynamically paginate the results depending on the terminal height.
     #[arg(short, long)]
     paginate: bool,
+
+    /// Ignore the ignore list and search among everything possible.
+    #[arg(short, long)]
+    all: bool,
 
     /// Optional file path to write the selected directory to (for shell integration).
     #[arg(long, hide = true)]
@@ -49,7 +52,7 @@ fn main() {
     
     // We use an unbounded channel. The Walker threads blast through the disk at max speed
     // and push everything into the channel/cache, so we can sort them globally by shortest-path!
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     let is_done = Arc::new(AtomicBool::new(false));
 
@@ -58,6 +61,7 @@ fn main() {
         args.search_term.clone(),
         config.clone(),
         args.regex,
+        args.all,
         tx,
         Arc::clone(&is_done),
     );

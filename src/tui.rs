@@ -2,7 +2,6 @@ use std::cmp;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -278,7 +277,7 @@ pub fn run_tui(
     paginate: bool,
     current_dir: &Path,
     mut page_size: usize,
-    rx: Receiver<PathBuf>,
+    rx: crossbeam_channel::Receiver<PathBuf>,
     is_done: Arc<AtomicBool>,
 ) -> Option<PathBuf> {
     if paginate {
