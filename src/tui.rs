@@ -465,7 +465,7 @@ pub fn run_tui(
                     if in_search_mode {
                         in_search_mode = false;
                         if let Some(pos) = cached_paths.iter().position(|p| {
-                            p.display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase())
+                            p.file_name().unwrap_or_default().to_string_lossy().to_lowercase().contains(&tui_search_query.to_lowercase())
                         }) {
                             curr_page = pos / page_size;
                             curr_sel = pos % page_size;
@@ -559,13 +559,13 @@ pub fn run_tui(
                             'n' => {
                                 let global_idx = curr_page * page_size + curr_sel;
                                 if let Some(offset) = cached_paths.iter().skip(global_idx + 1).position(|p| {
-                                    p.display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase())
+                                    p.file_name().unwrap_or_default().to_string_lossy().to_lowercase().contains(&tui_search_query.to_lowercase())
                                 }) {
                                     let pos = global_idx + 1 + offset;
                                     curr_page = pos / page_size;
                                     curr_sel = pos % page_size;
                                 } else if let Some(pos) = cached_paths.iter().position(|p| {
-                                    p.display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase())
+                                    p.file_name().unwrap_or_default().to_string_lossy().to_lowercase().contains(&tui_search_query.to_lowercase())
                                 }) {
                                     curr_page = pos / page_size;
                                     curr_sel = pos % page_size;
@@ -575,14 +575,14 @@ pub fn run_tui(
                                 let global_idx = curr_page * page_size + curr_sel;
                                 let mut found = None;
                                 for i in (0..global_idx).rev() {
-                                    if cached_paths[i].display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase()) {
+                                    if cached_paths[i].file_name().unwrap_or_default().to_string_lossy().to_lowercase().contains(&tui_search_query.to_lowercase()) {
                                         found = Some(i);
                                         break;
                                     }
                                 }
                                 if found.is_none() {
                                     for i in (global_idx..cached_paths.len()).rev() {
-                                        if cached_paths[i].display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase()) {
+                                        if cached_paths[i].file_name().unwrap_or_default().to_string_lossy().to_lowercase().contains(&tui_search_query.to_lowercase()) {
                                             found = Some(i);
                                             break;
                                         }
