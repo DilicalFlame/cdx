@@ -1,11 +1,29 @@
 use std::cmp;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use colored::*;
 use console::{Key, Term};
+
+fn sort_paths(paths: &mut Vec<PathBuf>) {
+    // Sort by Number of Components (Depth) first, then Alphabetically secondary
+    paths.sort_by(|a, b| {
+        let count_a = a.components().count();
+        let count_b = b.components().count();
+        match count_a.cmp(&count_b) {
+            cmp::Ordering::Equal => a.cmp(b),
+            other => other,
+        }
+    });
+}
+
+fn chunks(paths: &[PathBuf], size: usize) -> Vec<Vec<PathBuf>> {
+    paths.chunks(size).map(|c| c.to_vec()).collect()
+}
 
 fn render_page(
     term: &mut Term,
@@ -121,32 +139,62 @@ pub fn run_tui(
     rx: Receiver<PathBuf>,
     is_done: Arc<AtomicBool>,
 ) -> Option<PathBuf> {
-    let mut cached_pages: Vec<Vec<PathBuf>> = Vec::new();
+    let mut term = Term::stdout();
+    let _ = term.hide_cursor();
 
-    // Load first page
-    let mut first_page = Vec::new();
-    while first_page.len() < page_size {
-        if let Ok(p) = rx.recv() {
-            first_page.push(p);
-        } else {
+    let mut cached_paths: Vec<PathBuf> = Vec::new();
+    let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let mut frame_idx = 0;
+    
+    // Draw initial loading spinner
+    let mut spinner_drawn = true;
+    let _ = term.write_line(&format!(" {} {}", spinner_frames[frame_idx].cyan(), "Crawling file system...".dimmed()));
+
+    // Collect all matches across the entire drive instantly into memory
+    loop {
+        // Pull continuously while there is data
+        while let Ok(p) = rx.try_recv() {
+            cached_paths.push(p);
+        }
+
+        if is_done.load(Ordering::SeqCst) {
+            // Drain the last few items
+            while let Ok(p) = rx.try_recv() {
+                cached_paths.push(p);
+            }
             break;
         }
+
+        // UI Spinner feedback loop so the user knows it's doing heavy I/O
+        frame_idx = (frame_idx + 1) % spinner_frames.len();
+        let _ = term.clear_last_lines(1);
+        let _ = term.write_line(&format!(" {} {} (Found {} so far)", 
+            spinner_frames[frame_idx].cyan(), 
+            "Crawling file system...".dimmed(),
+            cached_paths.len().to_string().yellow()
+        ));
+        
+        std::thread::sleep(Duration::from_millis(50));
     }
 
-    if first_page.is_empty() {
+    if spinner_drawn {
+        let _ = term.clear_last_lines(1);
+    }
+
+    if cached_paths.is_empty() {
         eprintln!("{}", "No matching directory found.".red());
         return None;
     }
 
-    // Auto-select if there is exactly 1 match and search is completely finished
-    if first_page.len() == 1 && is_done.load(Ordering::SeqCst) && rx.try_recv().is_err() {
-        return Some(first_page[0].clone());
+    // Single global deterministic sort: Depth-First, then Alphabetical!
+    sort_paths(&mut cached_paths);
+
+    // Auto-select if there is exactly 1 match
+    if cached_paths.len() == 1 {
+        return Some(cached_paths[0].clone());
     }
 
-    cached_pages.push(first_page);
-
-    let mut term = Term::stdout();
-    let _ = term.hide_cursor();
+    let paged_cache = chunks(&cached_paths, page_size);
 
     let mut curr_page = 0;
     let mut curr_sel = 0;
@@ -154,8 +202,7 @@ pub fn run_tui(
     let mut selected_path: Option<PathBuf> = None;
 
     loop {
-        let is_search_finished = is_done.load(Ordering::SeqCst);
-        let current_items = &cached_pages[curr_page];
+        let current_items = &paged_cache[curr_page];
 
         render_page(
             &mut term,
@@ -164,8 +211,8 @@ pub fn run_tui(
             current_dir,
             curr_sel,
             curr_page,
-            cached_pages.len(),
-            is_search_finished,
+            paged_cache.len(),
+            true, // is_done is always true now because we pre-collected
             page_size,
             &mut lines_drawn,
         );
@@ -177,64 +224,35 @@ pub fn run_tui(
                 } else if curr_page > 0 {
                     // Wrap to bottom of previous page
                     curr_page -= 1;
-                    curr_sel = cached_pages[curr_page].len() - 1;
+                    curr_sel = paged_cache[curr_page].len() - 1;
                 }
             }
             Key::ArrowDown => {
-                let current_items = &cached_pages[curr_page];
+                let current_items = &paged_cache[curr_page];
                 if curr_sel + 1 < current_items.len() {
                     curr_sel += 1;
                 } else {
                     // Dive into next page
-                    if curr_page + 1 < cached_pages.len() {
+                    if curr_page + 1 < paged_cache.len() {
                         curr_page += 1;
                         curr_sel = 0;
-                    } else if !is_done.load(Ordering::SeqCst) {
-                        let mut next_page = Vec::new();
-                        while next_page.len() < page_size {
-                            if let Ok(p) = rx.recv() {
-                                next_page.push(p);
-                            } else {
-                                break;
-                            }
-                        }
-                        if !next_page.is_empty() {
-                            cached_pages.push(next_page);
-                            curr_page += 1;
-                            curr_sel = 0;
-                        }
                     }
                 }
             }
             Key::ArrowLeft => {
                 if curr_page > 0 {
                     curr_page -= 1;
-                    // Clamp selection to not overflow bound of previous page
-                    curr_sel = cmp::min(curr_sel, cached_pages[curr_page].len() - 1);
+                    curr_sel = cmp::min(curr_sel, paged_cache[curr_page].len() - 1);
                 }
             }
             Key::ArrowRight => {
-                if curr_page + 1 < cached_pages.len() {
+                if curr_page + 1 < paged_cache.len() {
                     curr_page += 1;
-                    curr_sel = cmp::min(curr_sel, cached_pages[curr_page].len() - 1);
-                } else {
-                    let mut next_page = Vec::new();
-                    while next_page.len() < page_size {
-                        if let Ok(p) = rx.recv() {
-                            next_page.push(p);
-                        } else {
-                            break;
-                        }
-                    }
-                    if !next_page.is_empty() {
-                        cached_pages.push(next_page);
-                        curr_page += 1;
-                        curr_sel = 0;
-                    }
+                    curr_sel = cmp::min(curr_sel, paged_cache[curr_page].len() - 1);
                 }
             }
             Key::Enter => {
-                selected_path = Some(cached_pages[curr_page][curr_sel].clone());
+                selected_path = Some(paged_cache[curr_page][curr_sel].clone());
                 break;
             }
             Key::Escape | Key::Char('q') | Key::Char('c') => {

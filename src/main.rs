@@ -43,8 +43,9 @@ fn main() {
 
     let current_dir = env::current_dir().expect("Failed to get current directory.");
     
-    // We use a bounded channel. When full, Walker threads block automatically!
-    let (tx, rx) = mpsc::sync_channel(config.page_size * 2);
+    // We use an unbounded channel. The Walker threads blast through the disk at max speed
+    // and push everything into the channel/cache, so we can sort them globally by shortest-path!
+    let (tx, rx) = mpsc::channel();
 
     let is_done = Arc::new(AtomicBool::new(false));
 
