@@ -22,6 +22,10 @@ struct Args {
     #[arg(short, long)]
     regex: bool,
 
+    /// Dynamically paginate the results depending on the terminal height.
+    #[arg(short, long)]
+    paginate: bool,
+
     /// Optional file path to write the selected directory to (for shell integration).
     #[arg(long, hide = true)]
     out: Option<PathBuf>,
@@ -61,6 +65,7 @@ fn main() {
     let selected_path = tui::run_tui(
         &args.search_term,
         args.regex,
+        args.paginate,
         &current_dir,
         config.page_size,
         rx,

@@ -1,4 +1,5 @@
 use std::cmp;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
@@ -8,6 +9,7 @@ use std::time::Duration;
 use colored::*;
 use console::{Key, Term};
 use regex::RegexBuilder;
+use terminal_size::{terminal_size, Height, Width};
 
 fn highlight_and_chunk_path(text: &str, term: &str, is_regex: bool, term_width: usize) -> Vec<String> {
     let mut highlighted_spans = Vec::new();
@@ -108,6 +110,7 @@ fn render_page(
     term: &mut Term,
     term_str: &str,
     is_regex: bool,
+    paginate: bool,
     page_items: &[PathBuf],
     current_dir: &Path,
     curr_sel: usize,
@@ -115,13 +118,20 @@ fn render_page(
     total_pages: usize,
     page_size: usize,
     lines_drawn: &mut usize,
+    in_search_mode: bool,
+    tui_search_query: &str,
 ) {
-    if *lines_drawn > 0 {
+    if !paginate && *lines_drawn > 0 {
         let _ = term.clear_last_lines(*lines_drawn);
     }
 
     let mut lines = Vec::new();
-    let (_, cols) = term.size();
+    let (_, cols) = if let Some((Width(w), Height(h))) = terminal_size() {
+        (h as u16, w as u16)
+    } else {
+        term.size()
+    };
+    
     let term_width = (cols as usize).saturating_sub(1).max(40); // Provide safe margin and minimum bounds
 
     let has_next = curr_page + 1 < total_pages;
@@ -204,32 +214,66 @@ fn render_page(
         }
     }
 
-    lines.push(format!("{}", "─".repeat(term_width).dimmed()));
+    let mut footer = Vec::new();
+    footer.push(format!("{}", "─".repeat(term_width).dimmed()));
 
-    // Dedicated Full-Path Preview section for currently hovered item
-    if let Some(hover_path) = page_items.get(curr_sel) {
-        let abs_path = hover_path.display().to_string();
-        let preview_lines = highlight_and_chunk_path(&abs_path, term_str, is_regex, term_width);
-        for line in preview_lines {
-            lines.push(line);
+    if in_search_mode {
+        footer.push(format!(" {}", format!("/{}", tui_search_query).yellow().bold()));
+    } else {
+        if let Some(hover_path) = page_items.get(curr_sel) {
+            let abs_path = hover_path.display().to_string();
+            let mut preview_lines = highlight_and_chunk_path(&abs_path, term_str, is_regex, term_width);
+            preview_lines.truncate(2);
+            for line in preview_lines {
+                footer.push(line);
+            }
+        } else {
+            footer.push(String::new());
         }
-        lines.push(format!("{}", "─".repeat(term_width).dimmed()));
     }
 
-    let output = lines.join("\n");
-    let _ = term.write_line(&output);
+    if paginate {
+        let (rows, _) = if let Some((Width(w), Height(h))) = terminal_size() {
+            (h as u16, w as u16)
+        } else {
+            term.size()
+        };
+        let target_len = (rows as usize).saturating_sub(footer.len());
+        while lines.len() < target_len {
+            lines.push(String::new());
+        }
+    }
 
-    *lines_drawn = lines.len();
+    for fl in footer {
+        lines.push(fl);
+    }
+
+    if paginate {
+        *lines_drawn = lines.len();
+        let output = lines.into_iter().map(|l| format!("{}\x1B[K", l)).collect::<Vec<_>>().join("\n");
+        print!("\x1B[H{}", output);
+        let _ = std::io::stdout().flush();
+    } else {
+        *lines_drawn = lines.len();
+        let output = lines.join("\n");
+        let _ = term.write_line(&output);
+    }
 }
 
 pub fn run_tui(
     term_str: &str,
     is_regex: bool,
+    paginate: bool,
     current_dir: &Path,
-    page_size: usize,
+    mut page_size: usize,
     rx: Receiver<PathBuf>,
     is_done: Arc<AtomicBool>,
 ) -> Option<PathBuf> {
+    if paginate {
+        print!("\x1B[?1049h\x1B[H");
+        let _ = std::io::stdout().flush();
+    }
+
     let mut term = Term::stdout();
     let _ = term.hide_cursor();
 
@@ -285,20 +329,53 @@ pub fn run_tui(
         return Some(cached_paths[0].clone());
     }
 
-    let paged_cache = chunks(&cached_paths, page_size);
-
     let mut curr_page = 0;
     let mut curr_sel = 0;
     let mut lines_drawn = 0;
     let mut selected_path: Option<PathBuf> = None;
+    let mut tui_search_query = String::new();
+    let mut in_search_mode = false;
 
     loop {
+        // Compute dynamic page size if paginate is explicitly requested
+        if paginate {
+            let (rows, _) = if let Some((Width(w), Height(h))) = terminal_size() {
+                (h as u16, w as u16)
+            } else {
+                term.size()
+            };
+            // The header is 3 lines.
+            // The footer is dynamically evaluated up to 4 lines (1 `─`, up to 2 path preview, 1 search bar).
+            // This totals exactly 7 lines reserved. 
+            let new_page_size = (rows as usize).saturating_sub(7).max(1);
+            if new_page_size != page_size && page_size > 0 {
+                let global_idx = curr_page * page_size + curr_sel;
+                page_size = new_page_size;
+                if !cached_paths.is_empty() {
+                    curr_page = cmp::min(global_idx / page_size, cached_paths.len().saturating_sub(1) / page_size);
+                    let page_len = cmp::min(page_size, cached_paths.len() - curr_page * page_size);
+                    curr_sel = cmp::min(global_idx % page_size, page_len.saturating_sub(1));
+                }
+            } else if page_size == 0 {
+                page_size = new_page_size;
+            }
+        }
+
+        let paged_cache = chunks(&cached_paths, page_size);
+        if paged_cache.is_empty() { break; }
+
+        if curr_page >= paged_cache.len() {
+            curr_page = paged_cache.len().saturating_sub(1);
+            curr_sel = paged_cache[curr_page].len().saturating_sub(1);
+        }
+
         let current_items = &paged_cache[curr_page];
 
         render_page(
             &mut term,
             term_str,
             is_regex,
+            paginate,
             current_items,
             current_dir,
             curr_sel,
@@ -306,54 +383,135 @@ pub fn run_tui(
             paged_cache.len(),
             page_size,
             &mut lines_drawn,
+            in_search_mode,
+            &tui_search_query,
         );
 
         match term.read_key().unwrap() {
+            Key::Escape => {
+                if in_search_mode {
+                    in_search_mode = false;
+                } else {
+                    break;
+                }
+            }
+            Key::Enter => {
+                if in_search_mode {
+                    in_search_mode = false;
+                    if let Some(pos) = cached_paths.iter().position(|p| {
+                        p.display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase())
+                    }) {
+                        curr_page = pos / page_size;
+                        curr_sel = pos % page_size;
+                    }
+                } else {
+                    selected_path = Some(paged_cache[curr_page][curr_sel].clone());
+                    break;
+                }
+            }
+            Key::Backspace => {
+                if in_search_mode {
+                    tui_search_query.pop();
+                }
+            }
             Key::ArrowUp => {
-                if curr_sel > 0 {
-                    curr_sel -= 1;
-                } else if curr_page > 0 {
-                    // Wrap to bottom of previous page
-                    curr_page -= 1;
-                    curr_sel = paged_cache[curr_page].len() - 1;
+                if !in_search_mode {
+                    if curr_sel > 0 {
+                        curr_sel -= 1;
+                    } else if curr_page > 0 {
+                        curr_page -= 1;
+                        curr_sel = paged_cache[curr_page].len() - 1;
+                    }
                 }
             }
             Key::ArrowDown => {
-                let current_items = &paged_cache[curr_page];
-                if curr_sel + 1 < current_items.len() {
-                    curr_sel += 1;
-                } else {
-                    // Dive into next page
-                    if curr_page + 1 < paged_cache.len() {
+                if !in_search_mode {
+                    let current_items = &paged_cache[curr_page];
+                    if curr_sel + 1 < current_items.len() {
+                        curr_sel += 1;
+                    } else if curr_page + 1 < paged_cache.len() {
                         curr_page += 1;
                         curr_sel = 0;
                     }
                 }
             }
             Key::ArrowLeft => {
-                if curr_page > 0 {
-                    curr_page -= 1;
-                    curr_sel = cmp::min(curr_sel, paged_cache[curr_page].len() - 1);
+                if !in_search_mode {
+                    if curr_page > 0 {
+                        curr_page -= 1;
+                        curr_sel = cmp::min(curr_sel, paged_cache[curr_page].len().saturating_sub(1));
+                    }
                 }
             }
             Key::ArrowRight => {
-                if curr_page + 1 < paged_cache.len() {
-                    curr_page += 1;
-                    curr_sel = cmp::min(curr_sel, paged_cache[curr_page].len() - 1);
+                if !in_search_mode {
+                    if curr_page + 1 < paged_cache.len() {
+                        curr_page += 1;
+                        curr_sel = cmp::min(curr_sel, paged_cache[curr_page].len().saturating_sub(1));
+                    }
                 }
             }
-            Key::Enter => {
-                selected_path = Some(paged_cache[curr_page][curr_sel].clone());
-                break;
-            }
-            Key::Escape | Key::Char('q') | Key::Char('c') => {
-                break;
+            Key::Char(c) => {
+                if in_search_mode {
+                    tui_search_query.push(c);
+                } else {
+                    match c {
+                        '/' => {
+                            in_search_mode = true;
+                            tui_search_query.clear();
+                        }
+                        'n' => {
+                            let global_idx = curr_page * page_size + curr_sel;
+                            if let Some(offset) = cached_paths.iter().skip(global_idx + 1).position(|p| {
+                                p.display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase())
+                            }) {
+                                let pos = global_idx + 1 + offset;
+                                curr_page = pos / page_size;
+                                curr_sel = pos % page_size;
+                            } else if let Some(pos) = cached_paths.iter().position(|p| {
+                                p.display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase())
+                            }) {
+                                curr_page = pos / page_size;
+                                curr_sel = pos % page_size;
+                            }
+                        }
+                        'N' => {
+                            let global_idx = curr_page * page_size + curr_sel;
+                            let mut found = None;
+                            for i in (0..global_idx).rev() {
+                                if cached_paths[i].display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase()) {
+                                    found = Some(i);
+                                    break;
+                                }
+                            }
+                            if found.is_none() {
+                                for i in (global_idx..cached_paths.len()).rev() {
+                                    if cached_paths[i].display().to_string().to_lowercase().contains(&tui_search_query.to_lowercase()) {
+                                        found = Some(i);
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(pos) = found {
+                                curr_page = pos / page_size;
+                                curr_sel = pos % page_size;
+                            }
+                        }
+                        'q' | 'c' => {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
             }
             _ => {}
         }
     }
 
-    if lines_drawn > 0 {
+    if paginate {
+        print!("\x1B[?1049l");
+        let _ = std::io::stdout().flush();
+    } else if lines_drawn > 0 {
         let _ = term.clear_last_lines(lines_drawn);
     }
 

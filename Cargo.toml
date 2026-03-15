@@ -12,4 +12,5 @@ ignore = "0.4.25"
 regex = "1.12.3"
 serde = { version = "1.0.228", features = ["derive"] }
 tempfile = "3.27.0"
+terminal_size = "0.4.3"
 toml = "1.0.6"
