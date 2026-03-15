@@ -117,6 +117,7 @@ fn render_page(
     curr_page: usize,
     total_pages: usize,
     page_size: usize,
+    term_rows: usize,
     lines_drawn: &mut usize,
     in_search_mode: bool,
     tui_search_query: &str,
@@ -144,13 +145,46 @@ fn render_page(
     lines.push(format!(" {}   {}", page_info.yellow(), controls.dimmed()));
     lines.push(format!("{}", "─".repeat(term_width).dimmed()));
 
-    let max_dir_width = cmp::max(20, term_width / 2); // Give directory name max 50% of screen width
+    // Build the footer first so we know its height
+    let mut footer = Vec::new();
+    footer.push(format!("{}", "─".repeat(term_width).dimmed()));
 
-    for i in 0..page_size {
+    if in_search_mode {
+        footer.push(format!(" {}", format!("/{}", tui_search_query).yellow().bold()));
+    } else if let Some(hover_path) = page_items.get(curr_sel) {
+        let abs_path = hover_path.display().to_string();
+        let preview_lines = highlight_and_chunk_path(&abs_path, term_str, is_regex, term_width);
+        for line in preview_lines {
+            footer.push(line);
+        }
+    }
+    footer.push(format!("{}", "─".repeat(term_width).dimmed()));
+
+    // Determine how many items we can actually show given the footer size
+    // Header = 3 lines, so available for items = term_rows - 3 - footer.len()
+    let max_visible = if paginate {
+        term_rows.saturating_sub(3 + footer.len()).max(1)
+    } else {
+        page_size // Non-paginate mode: show all page items as usual
+    };
+
+    // Compute visible window: trim from bottom, but ensure selected item is visible
+    let visible_count = cmp::min(max_visible, page_items.len());
+    let vis_start = if curr_sel >= visible_count {
+        curr_sel - visible_count + 1
+    } else {
+        0
+    };
+    let vis_end = vis_start + visible_count;
+
+    let max_dir_width = cmp::max(20, term_width / 2);
+
+    for i in vis_start..vis_end {
         if i < page_items.len() {
             let path = &page_items[i];
             let dir_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let rel_path = path.strip_prefix(current_dir).unwrap_or(path).display().to_string();
+            let rel_path = path.strip_prefix(current_dir).unwrap_or(path);
+            let rel_path = rel_path.parent().map(|p| p.display().to_string()).unwrap_or_default();
 
             let dir_width = console::measure_text_width(&dir_name);
             let rel_width = console::measure_text_width(&rel_path);
@@ -209,36 +243,14 @@ fn render_page(
                     display_rel_path.dimmed()
                 ));
             }
-        } else {
-            lines.push("".to_string()); // Padding to keep height consistent between pages
-        }
-    }
-
-    let mut footer = Vec::new();
-    footer.push(format!("{}", "─".repeat(term_width).dimmed()));
-
-    if in_search_mode {
-        footer.push(format!(" {}", format!("/{}", tui_search_query).yellow().bold()));
-    } else {
-        if let Some(hover_path) = page_items.get(curr_sel) {
-            let abs_path = hover_path.display().to_string();
-            let mut preview_lines = highlight_and_chunk_path(&abs_path, term_str, is_regex, term_width);
-            preview_lines.truncate(2);
-            for line in preview_lines {
-                footer.push(line);
-            }
-        } else {
-            footer.push(String::new());
+        } else if paginate {
+            lines.push("".to_string());
         }
     }
 
     if paginate {
-        let (rows, _) = if let Some((Width(w), Height(h))) = terminal_size() {
-            (h as u16, w as u16)
-        } else {
-            term.size()
-        };
-        let target_len = (rows as usize).saturating_sub(footer.len());
+        // Pad between items and footer to push footer to the bottom
+        let target_len = term_rows.saturating_sub(footer.len());
         while lines.len() < target_len {
             lines.push(String::new());
         }
@@ -337,27 +349,30 @@ pub fn run_tui(
     let mut in_search_mode = false;
 
     loop {
-        // Compute dynamic page size if paginate is explicitly requested
-        if paginate {
-            let (rows, _) = if let Some((Width(w), Height(h))) = terminal_size() {
-                (h as u16, w as u16)
+        // Compute page size with fixed minimal footer (separator + 1 path line + separator = 3 lines)
+        // This keeps chunking stable. render_page handles the visual trimming dynamically.
+        let (term_rows, term_cols) = if paginate {
+            if let Some((Width(w), Height(h))) = terminal_size() {
+                (h as usize, w as usize)
             } else {
-                term.size()
-            };
-            // The header is 3 lines.
-            // The footer is dynamically evaluated up to 4 lines (1 `─`, up to 2 path preview, 1 search bar).
-            // This totals exactly 7 lines reserved. 
-            let new_page_size = (rows as usize).saturating_sub(7).max(1);
-            if new_page_size != page_size && page_size > 0 {
-                let global_idx = curr_page * page_size + curr_sel;
+                let (r, c) = term.size();
+                (r as usize, c as usize)
+            }
+        } else {
+            (0, 0) // Not used in non-paginate mode
+        };
+
+        if paginate {
+            // 3 header + 3 minimal footer = 6 lines reserved
+            let new_page_size = term_rows.saturating_sub(6).max(1);
+            if new_page_size != page_size {
+                let gi = if page_size > 0 { curr_page * page_size + curr_sel } else { 0 };
                 page_size = new_page_size;
                 if !cached_paths.is_empty() {
-                    curr_page = cmp::min(global_idx / page_size, cached_paths.len().saturating_sub(1) / page_size);
+                    curr_page = cmp::min(gi / page_size, cached_paths.len().saturating_sub(1) / page_size);
                     let page_len = cmp::min(page_size, cached_paths.len() - curr_page * page_size);
-                    curr_sel = cmp::min(global_idx % page_size, page_len.saturating_sub(1));
+                    curr_sel = cmp::min(gi % page_size, page_len.saturating_sub(1));
                 }
-            } else if page_size == 0 {
-                page_size = new_page_size;
             }
         }
 
@@ -382,6 +397,7 @@ pub fn run_tui(
             curr_page,
             paged_cache.len(),
             page_size,
+            term_rows,
             &mut lines_drawn,
             in_search_mode,
             &tui_search_query,
@@ -456,6 +472,35 @@ pub fn run_tui(
                     tui_search_query.push(c);
                 } else {
                     match c {
+                        'k' => {
+                            if curr_sel > 0 {
+                                curr_sel -= 1;
+                            } else if curr_page > 0 {
+                                curr_page -= 1;
+                                curr_sel = paged_cache[curr_page].len() - 1;
+                            }
+                        }
+                        'j' => {
+                            let current_items = &paged_cache[curr_page];
+                            if curr_sel + 1 < current_items.len() {
+                                curr_sel += 1;
+                            } else if curr_page + 1 < paged_cache.len() {
+                                curr_page += 1;
+                                curr_sel = 0;
+                            }
+                        }
+                        'h' => {
+                            if curr_page > 0 {
+                                curr_page -= 1;
+                                curr_sel = cmp::min(curr_sel, paged_cache[curr_page].len().saturating_sub(1));
+                            }
+                        }
+                        'l' => {
+                            if curr_page + 1 < paged_cache.len() {
+                                curr_page += 1;
+                                curr_sel = cmp::min(curr_sel, paged_cache[curr_page].len().saturating_sub(1));
+                            }
+                        }
                         '/' => {
                             in_search_mode = true;
                             tui_search_query.clear();
